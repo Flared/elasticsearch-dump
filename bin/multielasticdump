@@ -15,6 +15,8 @@ const request = require('request')
 const { fork } = require('child_process')
 const url = require('url')
 const _ = require('lodash')
+const { elasticsearch } = require(path.join(__dirname, '..', 'lib', 'transports', 'elasticsearch.js'))
+const aws4signer = require(path.join(__dirname, '..', 'lib', 'aws4signer.js'))
 const ArgParser = require(path.join(__dirname, '..', 'lib', 'argv.js'))
 const addAuth = require(path.join(__dirname, '..', 'lib', 'add-auth.js'))
 const versionCheck = require(path.join(__dirname, '..', 'lib', 'version-check.js'))
@@ -22,6 +24,7 @@ const AWS = require('aws-sdk')
 const initAws = require(path.join(__dirname, '..', 'lib', 'init-aws.js'))
 
 const options = {}
+const jsonOptions = {}
 let matchedIndexes = []
 let working = 0
 let complete = 0
@@ -60,6 +63,8 @@ const defaults = {
   suffix: '',
   transform: null,
   headers: null,
+  'input-headers': null,
+  'output-headers': null,
   searchBody: null,
   searchWithTemplate: null,
   cert: null,
@@ -106,6 +111,9 @@ versionCheck()
 const args = new ArgParser({ options })
 args.parse(argv, defaults)
 
+const jsonArgs = new ArgParser({ options: jsonOptions, parseJSONOpts: true})
+jsonArgs.parse(argv, defaults)
+
 _.split(options.ignoreType, ',').forEach(field => {
   const key = `ignore${_.upperFirst(field)}`
   if (_.has(options, key)) {
@@ -123,6 +131,8 @@ if (options.includeType) {
 
 const commonParams = [
   `--headers=${options.headers}`,
+  `--input-headers=${options['input-headers']}`,
+  `--output-headers=${options['output-headers']}`,
   `--cert=${options.cert}`,
   `--key=${options.key}`,
   `--pass=${options.pass}`,
@@ -246,7 +256,11 @@ const listFiles = (dir, callback) => {
   }
 }
 
-const elasticRequest = (params, callback) => {
+const createElasticsearchTransport = (type) => {
+  return new elasticsearch({options: jsonOptions}, options[type], { type });
+}
+
+const elasticRequest = (transport, params, callback) => {
   _.defaults(params, {
     method: 'GET',
     ignoreErrors: false,
@@ -269,28 +283,34 @@ const elasticRequest = (params, callback) => {
   }
 
   args.log('debug', `${params.method} ${params.path}`);
-  request(req, (err, response) => {
-    if (err) {
-      args.log('err', err)
-      process.exit(1)
-    }
-    args.log('debug', `${params.method} ${params.path} -> ${response.statusCode} ${response.statusMessage}`);
-    if (response.statusCode >= 400 && !params.ignoreErrors) {
-      process.exit(1)
-    }
-    response = JSON.parse(response.body)
-    if ('error' in response && !params.ignoreErrors) {
-      args.log('err', response.error.reason)
-      process.exit(1)
-    }
+  aws4signer(req, transport).then(() => {
+    transport.baseRequest(req, (err, response) => {
+      if (err) {
+        args.log('err', err)
+        process.exit(1)
+      }
+      args.log('debug', `${params.method} ${params.path} -> ${response.statusCode} ${response.statusMessage}`);
+      if (response.statusCode >= 400 && !params.ignoreErrors) {
+        process.exit(1)
+      }
+      response = JSON.parse(response.body)
+      if ('error' in response && !params.ignoreErrors) {
+        args.log('err', response.error.reason)
+        process.exit(1)
+      }
 
-    if (callback) {
-      callback(response)
-    }
+      if (callback) {
+        callback(response)
+      }
+    })
+  }).catch((err) => {
+    args.log('err', err)
+    process.exit(1)
   })
 }
 
 const deleteIndexes = (indexes) => {
+  const transport = createElasticsearchTransport('output')
   const req = {
     method: 'DELETE',
     url: options.output,
@@ -298,24 +318,24 @@ const deleteIndexes = (indexes) => {
     ignoreErrors: true,
   }
 
-  elasticRequest(req)
+  elasticRequest(transport, req)
 }
 
 if (!options.input) { throw new Error('--input is required') }
 if (!options.output) { throw new Error('--output is required') }
 args.log('info', `We are performing : ${options.direction}`)
-args.log('info', `options: ${JSON.stringify(options)}`)
 
 const matchRegExp = new RegExp(options.match, 'i')
 if (options.direction === 'dump') {
   validateDirectory(options, 'output')
 
+  const transport = createElasticsearchTransport('input');
   const req = {
     url: options.input,
     path: '/_aliases',
   }
 
-  elasticRequest(req, (response) => {
+  elasticRequest(transport, req, (response) => {
     let indexes = response;
     if (!Array.isArray(response)) {
       indexes = Object.keys(response)
